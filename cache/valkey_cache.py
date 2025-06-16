@@ -10,35 +10,13 @@ Core VALKEY functionality including:
 import hashlib
 import json
 import logging
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
-from opentelemetry import trace
-
-from app.core.grafana.metrics import (
-    record_valkey_cache_delete,
-    record_valkey_cache_error,
-    record_valkey_cache_hit,
-    record_valkey_cache_miss,
-    record_valkey_cache_set,
-)
-from app.core.valkey_core.metrics import (
-    get_valkey_cache_deletes,
-    get_valkey_cache_errors,
-    get_valkey_cache_hits,
-    get_valkey_cache_misses,
-    get_valkey_cache_sets,
-)
-from app.core.telemetry.client import TelemetryClient
 from app.core.valkey_core.client import client as valkey_client
 
-telemetry = TelemetryClient(service_name="valkey_cache")
-
-tracer = trace.get_tracer(__name__)
 logger = logging.getLogger(__name__)
-
-
-import asyncio
 
 class ValkeyCache:
     """
@@ -56,28 +34,49 @@ class ValkeyCache:
         return self._client
 
     async def get(self, key: str, default: Any = None) -> Any:
-        raw_client = await self._get_raw_client()
-        value = await raw_client.get(key)
-        if value is None:
+        """Get a value from the cache"""
+        try:
+            raw_client = await self._get_raw_client()
+            value = await raw_client.get(key)
+            if value is None:
+                logger.debug(f"Cache miss for key: {key}")
+                return default
+                
+            logger.debug(f"Cache hit for key: {key}")
+            if isinstance(value, bytes):
+                return value.decode('utf-8')
+            return value
+        except Exception as e:
+            logger.warning(f"Error retrieving from VALKEY cache: {str(e)}")
             return default
-        if isinstance(value, bytes):
-            return value.decode('utf-8')
-        return value
 
     async def set(self, key: str, value: Any, ttl: int | None = None) -> None:
-        raw_client = await self._get_raw_client()
-        await raw_client.set(key, value, ex=ttl)
+        """Set a value in the cache with optional TTL"""
+        try:
+            raw_client = await self._get_raw_client()
+            await raw_client.set(key, value, ex=ttl)
+            logger.debug(f"Cache set for key: {key}")
+        except Exception as e:
+            logger.warning(f"Error setting VALKEY cache: {str(e)}")
 
     async def delete(self, key: str) -> bool:
-        raw_client = await self._get_raw_client()
-        result = await raw_client.delete(key)
-        return bool(result)
+        """Delete a key from the cache"""
+        try:
+            raw_client = await self._get_raw_client()
+            result = await raw_client.delete(key)
+            success = bool(result)
+            logger.debug(f"Cache delete for key: {key}, success: {success}")
+            return success
+        except Exception as e:
+            logger.warning(f"Error deleting from VALKEY cache: {str(e)}")
+            return False
 
     async def get_or_set(self, key: str, func: Callable[[], Any], ttl: int | None = None) -> Any:
-        # This still uses the global valkey_client, but you may want to refactor similarly
+        """Get a value from cache or compute and store it if not found"""
         return await get_or_set_cache(key, func, ttl)
 
     def cache_result(self, ttl: int | None = None, key_prefix: str = ""):
+        """Decorator for caching function results"""
         return cache_result(ttl, key_prefix)
 
 
@@ -90,23 +89,17 @@ async def get_cached_result(key: str, default: Any = None) -> Any:
     Returns:
         Cached value, or default if not found
     """
-    # Trace cache get
-    with telemetry.span_cache_operation("get", {"key": key}):
-        try:
-            value = await valkey_client.get(key)
-            if value is None:
-                get_valkey_cache_misses().inc()
-                record_valkey_cache_miss()
-                return default
-            get_valkey_cache_hits().inc()
-            record_valkey_cache_hit()
-            return value
-        except Exception as e:
-            # Record cache error
-            get_valkey_cache_errors().inc()
-            record_valkey_cache_error()
-            logger.warning(f"Error retrieving from VALKEY cache: {str(e)}")
+    try:
+        value = await valkey_client.get(key)
+        if value is None:
+            logger.debug(f"Cache miss for key: {key}")
             return default
+            
+        logger.debug(f"Cache hit for key: {key}")
+        return value
+    except Exception as e:
+        logger.warning(f"Error retrieving from VALKEY cache: {str(e)}")
+        return default
 
 
 async def invalidate_cache_key(key: str) -> bool:
@@ -117,23 +110,13 @@ async def invalidate_cache_key(key: str) -> bool:
     Returns:
         True if the key was found and deleted, False otherwise
     """
-    # Trace cache delete
-    with telemetry.span_cache_operation("delete", {"key": key}):
-        try:
-            result = bool(await valkey_client.delete(key))
-            if result:
-                get_valkey_cache_deletes().inc()
-                record_valkey_cache_delete()
-            else:
-                get_valkey_cache_misses().inc()
-                record_valkey_cache_miss()
-            return result
-        except Exception as e:
-            # Record cache error
-            get_valkey_cache_errors().inc()
-            record_valkey_cache_error()
-            logger.warning(f"Error invalidating VALKEY cache: {str(e)}")
-            return False
+    try:
+        result = bool(await valkey_client.delete(key))
+        logger.debug(f"Cache invalidate for key: {key}, success: {result}")
+        return result
+    except Exception as e:
+        logger.warning(f"Error invalidating VALKEY cache: {str(e)}")
+        return False
 
 
 async def get_or_set_cache(
@@ -148,27 +131,19 @@ async def get_or_set_cache(
     Returns:
         The cached or computed value
     """
-    # Trace get or set cache
-    with telemetry.span_cache_operation("get_or_set", {"key": key}):
-        try:
-            value = await valkey_client.get(key)
-            if value is not None:
-                get_valkey_cache_hits().inc()
-                record_valkey_cache_hit()
-                return value
-            get_valkey_cache_misses().inc()
-            record_valkey_cache_miss()
-            result = await func() if asyncio.iscoroutinefunction(func) else func()
-            await valkey_client.set(key, result, ex=ttl)
-            get_valkey_cache_sets().inc()
-            record_valkey_cache_set()
-            return result
-        except Exception as e:
-            # Record cache error
-            get_valkey_cache_errors().inc()
-            record_valkey_cache_error()
-            logger.error(f"Error computing or caching result in VALKEY: {str(e)}")
-            raise
+    try:
+        value = await valkey_client.get(key)
+        if value is not None:
+            logger.debug(f"Cache hit for key: {key}")
+            return value
+            
+        logger.debug(f"Cache miss for key: {key}")
+        result = await func() if asyncio.iscoroutinefunction(func) else func()
+        await valkey_client.set(key, result, ex=ttl)
+        return result
+    except Exception as e:
+        logger.error(f"Error computing or caching result in VALKEY: {str(e)}")
+        raise
 
 
 def cache_result(ttl: int | None = None, key_prefix: str = ""):
@@ -180,16 +155,17 @@ def cache_result(ttl: int | None = None, key_prefix: str = ""):
     Returns:
         Decorated function that uses VALKEY caching
     """
-
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         async def wrapper(*args, **kwargs):
             key_args = json.dumps(args, sort_keys=True, default=str)
             key_kwargs = json.dumps(kwargs, sort_keys=True, default=str)
             raw_key = f"{key_prefix}:{func.__name__}:{key_args}:{key_kwargs}"
             key = hashlib.md5(raw_key.encode()).hexdigest()
+            
             value = await get_cached_result(key)
             if value is not None:
                 return value
+                
             result = await func(*args, **kwargs)
             await valkey_client.set(key, result, ex=ttl)
             return result

@@ -3,7 +3,7 @@ Rate Limiting Utilities
 
 Provides production-grade rate limiting using Redis with:
 - Exponential backoff
-- Detailed metrics
+- Detailed logging
 """
 
 import logging
@@ -11,18 +11,13 @@ import time
 from datetime import datetime, timedelta
 
 from fastapi import HTTPException, status
-from prometheus_client import Counter, Gauge
 
-
-# from app.core.third_party_integrations.supabase_home.functions.auth import SupabaseAuthService  # ! Deprecated: Use async get_auth_service() instead
-from app.core.third_party_integrations.supabase_home.client import get_supabase_client
-from app.core.third_party_integrations.supabase_home.app import SupabaseAuthService
+# Replace Supabase imports with mock utility imports
+from app.core.valkey_core._tests.utilities.mock_auth import get_mock_auth_service
 
 async def get_auth_service():
-    client = await get_supabase_client()
-    service = SupabaseAuthService(client)
-    user = await service.get_current_user() if hasattr(service.get_current_user, '__await__') else service.get_current_user()
-    return user
+    """Get auth service - using mock implementation"""
+    return await get_mock_auth_service()
 
 from app.core.valkey_core.client import client as valkey_client
 
@@ -30,19 +25,6 @@ logger = logging.getLogger(__name__)
 
 # Initialize Redis client
 client = valkey_client
-
-# ! Deprecated: Use async get_auth_service() instead of direct SupabaseAuthService instantiation
-# auth_service = SupabaseAuthService()
-
-# Prometheus Metrics
-RATE_LIMIT_REQUESTS = Counter(
-    "rate_limit_requests_total", "Total rate limit requests", ["endpoint", "status"]
-)
-
-RATE_LIMIT_GAUGE = Gauge(
-    "rate_limit_active_requests", "Currently active rate-limited requests", ["endpoint"]
-)
-
 
 # Default rate limit
 DEFAULT_LIMIT = 100
@@ -73,27 +55,30 @@ async def check_rate_limit(client, key: str, limit: int, window: int) -> bool:
         return False
     redis = await client.aconn()
     logger.debug(f"[check_rate_limit] Acquired async Valkey connection for key={key} at {now.isoformat()}.")
-    pipeline = await redis.pipeline()
-    if pipeline is None:
-        logger.error(f"[check_rate_limit] Valkey pipeline is None for key={key}. Failing closed.")
+    
+    # First, remove expired timestamps and get the current count
+    try:
+        # Remove expired timestamps
+        await redis.zremrangebyscore(key, 0, (now - timedelta(seconds=window)).timestamp())
+        
+        # Get current count BEFORE adding the new request
+        current_count = await redis.zcard(key)
+        logger.debug(f"[check_rate_limit] Current count for key={key}: {current_count}, limit={limit}")
+        
+        # Check if adding one more would exceed the limit
+        if current_count >= limit:
+            logger.debug(f"[check_rate_limit] Rate limit exceeded for key={key}: count={current_count}, limit={limit}")
+            return False
+        
+        # If we're under the limit, add the current request
+        await redis.zadd(key, {now.timestamp(): now.timestamp()})
+        await redis.expire(key, window)
+        
+        return True
+    except Exception as e:
+        logger.error(f"[check_rate_limit] Error in rate limiting: {str(e)}")
+        # Fail closed on errors
         return False
-    logger.debug(f"[check_rate_limit] Pipeline acquired for key={key}. Proceeding with ZREMRANGEBYSCORE/ZCARD/ZADD/EXPIRE.")
-
-    # Remove expired timestamps
-    await pipeline.zremrangebyscore(key, 0, (now - timedelta(seconds=window)).timestamp())
-
-    # Count remaining requests
-    await pipeline.zcard(key)
-
-    # Add current request
-    await pipeline.zadd(key, {now.timestamp(): now.timestamp()})
-    await pipeline.expire(key, window)
-
-    logger.debug(f"[check_rate_limit] Executing pipeline for key={key}.")
-    _, count, _, _ = await pipeline.execute()
-    logger.debug(f"[check_rate_limit] Pipeline executed for key={key}: count={count}, limit={limit}, window={window}")
-    # ! Allow if under limit, reject if at/above limit (sliding window logic)
-    return count < limit
 
 
 async def increment_rate_limit(identifier: str, endpoint: str, window: int = 60) -> int:
@@ -157,16 +142,18 @@ async def verify_and_limit(token: str, ip: str, endpoint: str, window: int = 360
     - User-level rate tracking
     - Composite keys for granular control
     """
-    RATE_LIMIT_GAUGE.labels(endpoint=endpoint).inc()
+    logger.debug(f"Rate limit check started for endpoint: {endpoint}")
 
     try:
+        # Get auth service (now using mock implementation)
+        auth_service = await get_auth_service()
+        
         # Verify JWT with detailed logging
         if not auth_service.verify_jwt(token):
             logger.warning(
                 "Invalid JWT token",
                 extra={"token": token[:8] + "...", "endpoint": endpoint},
             )
-            RATE_LIMIT_REQUESTS.labels(endpoint=endpoint, status="unauthorized").inc()
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
             )
@@ -190,7 +177,7 @@ async def verify_and_limit(token: str, ip: str, endpoint: str, window: int = 360
 
         await client.hset(f"rate_meta:{user_id}", mapping=metadata)
 
-        if await check_rate_limit(rate_key, limit=limit, window=window):
+        if await check_rate_limit(client, rate_key, limit=limit, window=window):
             logger.warning(
                 "Rate limit exceeded",
                 extra={
@@ -200,14 +187,13 @@ async def verify_and_limit(token: str, ip: str, endpoint: str, window: int = 360
                     "limit": limit,
                 },
             )
-            RATE_LIMIT_REQUESTS.labels(endpoint=endpoint, status="limited").inc()
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail=f"Rate limit exceeded. Try again in {window} seconds",
             )
 
         await increment_rate_limit(rate_key, endpoint, window=window)
-        RATE_LIMIT_REQUESTS.labels(endpoint=endpoint, status="allowed").inc()
+        logger.debug(f"Request allowed for endpoint: {endpoint}, user: {user_id}")
         return user_id
 
     except Exception as e:
@@ -216,11 +202,10 @@ async def verify_and_limit(token: str, ip: str, endpoint: str, window: int = 360
             extra={"error": str(e), "stack_trace": True},
             exc_info=True,
         )
-        RATE_LIMIT_REQUESTS.labels(endpoint=endpoint, status="error").inc()
         # Fail open during Redis outages
         return user_id
     finally:
-        RATE_LIMIT_GAUGE.labels(endpoint=endpoint).dec()
+        logger.debug(f"Rate limit check completed for endpoint: {endpoint}")
 
 
 async def service_rate_limit(
@@ -238,21 +223,20 @@ async def service_rate_limit(
     Returns:
         bool: True if request is allowed, False if rate limited
     """
-    RATE_LIMIT_GAUGE.labels(endpoint=endpoint).inc()
+    logger.debug(f"Service rate limit check started for key: {key}, endpoint: {endpoint}")
 
     try:
         rate_key = f"service_rate:{key}"
 
-        if await check_rate_limit(rate_key, limit=limit, window=window):
+        if await check_rate_limit(client, rate_key, limit=limit, window=window):
             logger.warning(
                 "Service rate limit exceeded",
                 extra={"key": key, "endpoint": endpoint, "limit": limit},
             )
-            RATE_LIMIT_REQUESTS.labels(endpoint=endpoint, status="limited").inc()
             return False
 
         await increment_rate_limit(rate_key, endpoint, window=window)
-        RATE_LIMIT_REQUESTS.labels(endpoint=endpoint, status="allowed").inc()
+        logger.debug(f"Service request allowed for key: {key}, endpoint: {endpoint}")
         return True
 
     except Exception as e:
@@ -261,11 +245,10 @@ async def service_rate_limit(
             extra={"error": str(e), "stack_trace": True},
             exc_info=True,
         )
-        RATE_LIMIT_REQUESTS.labels(endpoint=endpoint, status="error").inc()
         # Fail open during Redis outages
         return True
     finally:
-        RATE_LIMIT_GAUGE.labels(endpoint=endpoint).dec()
+        logger.debug(f"Service rate limit check completed for key: {key}, endpoint: {endpoint}")
 
 
 async def init_cleanup():

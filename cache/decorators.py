@@ -7,18 +7,10 @@ import random
 from collections.abc import Callable, Coroutine
 from typing import Any, TypeVar
 
-from prometheus_client import Counter
-
 from app.core.valkey_core.client import ValkeyClient
-from app.core.valkey.config import ValkeyConfig
+from app.core.valkey_core.config import ValkeyConfig
 
 logger = logging.getLogger(__name__)
-
-# Metrics
-CACHE_HITS = Counter("cache_hits", "Number of cache hits", ["key_pattern"])
-CACHE_INVALIDATIONS = Counter(
-    "cache_invalidations", "Number of cache invalidations", ["pattern"]
-)
 
 
 async def get_valkey_client() -> ValkeyClient:
@@ -80,7 +72,7 @@ def cache(
 
             cached = await valkey_client.get(key, timeout=ValkeyConfig.VALKEY_TIMEOUT)
             if cached is not None:
-                CACHE_HITS.labels(key_pattern=key).inc()
+                logger.debug(f"Cache hit for {key}")
                 return cached
 
             logger.debug(f"Cache miss for {key}")
@@ -139,7 +131,7 @@ def valkey_cache(
 
             cached = await client_instance.get(key, timeout=ValkeyConfig.VALKEY_TIMEOUT)
             if cached is not None:
-                CACHE_HITS.labels(key_pattern=key).inc()
+                logger.debug(f"Cache hit for {key}")
                 return cached
 
             logger.debug(f"Valkey cache miss for {key}")
@@ -173,7 +165,7 @@ def get_or_set_cache(
             try:
                 cached = await redis.get(key)
                 if cached:
-                    CACHE_HITS.labels(key_pattern=key.split(":")[0]).inc()
+                    logger.debug(f"Cache hit for {key}")
 
                     if warm_cache and random.random() < 0.1:
                         asyncio.create_task(

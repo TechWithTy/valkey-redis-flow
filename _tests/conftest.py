@@ -11,15 +11,17 @@ import pytest_asyncio
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# If you have a ValkeyCache or similar, import here
-# from app.core.valkey_core.cache.valkey_cache import ValkeyCache
-# No need for Valkey server startup logic here; assume test environment provides Valkey.
 from unittest.mock import patch
-
-import pytest
 import socket
-import subprocess
 import time
+
+# Add this fixture to provide event_loop - use the built-in function event loop
+@pytest_asyncio.fixture
+def event_loop(request):
+    """Create an instance of the default event loop for each test case."""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
 
 @pytest.fixture(scope="session", autouse=True)
 def ensure_valkey_server():
@@ -38,20 +40,14 @@ def ensure_valkey_server():
         raise RuntimeError("No Redis/Valkey server running on localhost:6379. Please start docker-redis-1.")
     yield
 
-# --- Real async Valkey client fixture for integration tests ---
-# If using pytest-asyncio, import it here if needed
-import pytest_asyncio
 from valkey.asyncio import Valkey
 from valkey.exceptions import TimeoutError, ValkeyError
 
 from app.core.valkey_core.config import ValkeyConfig
-
 from app.core.valkey_core.client import ValkeyClient
 
-
-
 @pytest_asyncio.fixture
-async def valkey_client():
+async def valkey_client(event_loop):  # Make sure to accept event_loop parameter
     """Yields a connected production ValkeyClient instance for integration tests with metrics disabled."""
     # * Disable Prometheus metrics to avoid duplicate timeseries errors
     old_metrics = getattr(ValkeyConfig, "VALKEY_METRICS_ENABLED", None)
@@ -65,16 +61,12 @@ async def valkey_client():
         if old_metrics is not None:
             ValkeyConfig.VALKEY_METRICS_ENABLED = old_metrics
 
-
-
 from app.core.valkey_core.cache.valkey_cache import ValkeyCache
-
-from app.core.valkey_core.config import ValkeyConfig
 from app.core.valkey_core.limiting.rate_limit import check_rate_limit
 
-
+# Remove event_loop parameter from flush_valkey since it doesn't need it directly
 @pytest_asyncio.fixture(autouse=True)
-async def flush_valkey(event_loop, valkey_client):
+async def flush_valkey(valkey_client):
     """Flushes the Valkey database before and after each test for isolation."""
     await valkey_client.flushdb()
     yield
@@ -91,22 +83,16 @@ async def valkey_cache(event_loop):
     yield cache
     await cache.clear_namespace("test_")
 
-
 @pytest.fixture
 def rate_limit_checker():
-    """# Rate limit checker function with default values (Valkey)
-"""
-
+    """Rate limit checker function with default values (Valkey)"""
     async def checker(endpoint, identifier, limit=10, window=60):
         return await check_rate_limit(endpoint, identifier, limit, window)
-
     return checker
-
 
 @pytest.fixture(autouse=True)
 def reset_valkey_config():
-    """# Reset ValkeyConfig between tests
-"""
+    """Reset ValkeyConfig between tests"""
     original_attrs = {k: v for k, v in vars(ValkeyConfig).items() if not k.startswith('__')}
     yield
     # Restore only the attributes that were present originally
@@ -117,11 +103,9 @@ def reset_valkey_config():
             else:
                 delattr(ValkeyConfig, k)
 
-
 @pytest.fixture
 def mock_time():
-    """# Mock time module for time-sensitive tests
-"""
+    """Mock time module for time-sensitive tests"""
     with patch("time.time") as mock_time:
         mock_time.return_value = 0
         yield mock_time

@@ -5,7 +5,7 @@ import pytest_asyncio
 # ! with a low maxmemory (e.g., 1mb) and an eviction policy (e.g., volatile-lru, volatile-lfu, volatile-ttl).
 # ! Otherwise, Redis will NOT evict keys and all keys will remain present. See Valkey/Redis docs for details.
 
-from app.core.redis.algorithims.caching.valkey_fifo_cache import ValkeyFIFOCache
+from app.core.valkey_core.algorithims.caching.valkey_fifo_cache import ValkeyFIFOCache
 from app.core.valkey_core.algorithims.caching.valkey_lru_cache import ValkeyLRUCache
 from app.core.valkey_core.algorithims.caching.valkey_lfu_cache import ValkeyLFUCache
 from app.core.valkey_core.algorithims.caching.valkey_mru_cache import ValkeyMRUCache

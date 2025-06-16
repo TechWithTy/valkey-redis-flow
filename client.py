@@ -6,7 +6,6 @@ Follows best practices for:
 - Timeout handling
 - Error recovery
 - Sharding support
-- OpenTelemetry tracing for all key operations
 - Structured Valkey exception handling
 - Distributed locking
 """
@@ -16,9 +15,6 @@ import json
 import logging
 from typing import Any
 
-from opentelemetry import trace
-from opentelemetry.trace import StatusCode
-from prometheus_client import Gauge, Histogram
 from valkey.asyncio import Valkey, ValkeyCluster
 from valkey.backoff import (
     ConstantBackoff,
@@ -46,13 +42,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONNECTION_TIMEOUT = 5.0
 DEFAULT_SOCKET_TIMEOUT = 10.0
 DEFAULT_COMMAND_TIMEOUT = 5.0
-
-# Prometheus metrics
-SHARD_SIZE_GAUGE = None
-SHARD_OPS_GAUGE = None
-REQUEST_DURATION = None
-
-tracer = trace.get_tracer(__name__)
 
 
 class ValkeyLock:
@@ -84,87 +73,6 @@ class ValkeyLock:
 
 
 class ValkeyClient:
-    # ...
-    async def scan(self, match: str = "*") -> list[str]:
-        """
-        Asynchronously scan for all keys matching the pattern.
-        Uses the underlying Redis/Valkey SCAN command.
-        """
-        cursor = 0
-        keys = []
-        while True:
-            cursor, batch = await self._client.scan(cursor=cursor, match=match)
-            keys.extend(batch)
-            if cursor == 0:
-                break
-        return keys
-
-    async def lrem(self, key: str, count: int, value: str) -> int:
-        """
-        Remove elements from a list (like Redis LREM).
-        """
-        async def _action():
-            with tracer.start_as_current_span("valkey.lrem") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "lrem")
-                span.set_attribute("db.redis.key", key)
-                result = await (await self.get_client()).lrem(key, count, value)
-                span.set_status(StatusCode.OK)
-                return result
-        return await handle_valkey_exceptions(_action, logger=logger, endpoint="valkey.lrem")
-
-    async def rpush(self, key: str, value: str) -> int:
-        """
-        Append a value to a list (like Redis RPUSH).
-        """
-        async def _action():
-            with tracer.start_as_current_span("valkey.rpush") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "rpush")
-                span.set_attribute("db.redis.key", key)
-                result = await (await self.get_client()).rpush(key, value)
-                span.set_status(StatusCode.OK)
-                return result
-        return await handle_valkey_exceptions(_action, logger=logger, endpoint="valkey.rpush")
-
-    async def llen(self, key: str) -> int:
-        """
-        Get the length of a list (like Redis LLEN).
-        """
-        async def _action():
-            with tracer.start_as_current_span("valkey.llen") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "llen")
-                span.set_attribute("db.redis.key", key)
-                result = await (await self.get_client()).llen(key)
-                span.set_status(StatusCode.OK)
-                return result
-        return await handle_valkey_exceptions(_action, logger=logger, endpoint="valkey.llen")
-
-    async def rpop(self, key: str) -> str | None:
-        """
-        Remove and get the last element in a list (like Redis RPOP).
-        """
-        async def _action():
-            with tracer.start_as_current_span("valkey.rpop") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "rpop")
-                span.set_attribute("db.redis.key", key)
-                result = await (await self.get_client()).rpop(key)
-                span.set_status(StatusCode.OK)
-                return result
-        return await handle_valkey_exceptions(_action, logger=logger, endpoint="valkey.rpop")
-
-    # ... existing code ...
-    @property
-    def conn(self):
-        """Return the underlying Valkey/ValkeyCluster connection (sync, may be None if not initialized)."""
-        return self._client
-
-    async def aconn(self):
-        """Return the underlying Valkey/ValkeyCluster connection, initializing if needed (async)."""
-        return await self.get_client()
-
     """
     Valkey client wrapper with connection management and utilities.
 
@@ -173,7 +81,6 @@ class ValkeyClient:
     - Automatic reconnections
     - Timeout handling
     - Sharding support
-    - OpenTelemetry tracing for all key operations
     - Structured Valkey exception handling
     - Distributed locking (see lock method)
     """
@@ -186,29 +93,6 @@ class ValkeyClient:
         self._metrics_enabled = ValkeyConfig.VALKEY_METRICS_ENABLED
         self._metrics_namespace = getattr(
             ValkeyConfig, "REDIS_METRICS_NAMESPACE", "valkey"
-        )
-
-        # Only register metrics if enabled
-        if self._metrics_enabled:
-            self._register_metrics()
-
-    def _register_metrics(self):
-        global SHARD_SIZE_GAUGE, SHARD_OPS_GAUGE, REQUEST_DURATION
-        # Register Prometheus metrics with namespace if needed
-        SHARD_SIZE_GAUGE = Gauge(
-            f"{self._metrics_namespace}_shard_size_bytes",
-            "Size of Valkey shards in bytes",
-            ["shard"],
-        )
-        SHARD_OPS_GAUGE = Gauge(
-            f"{self._metrics_namespace}_shard_ops_per_sec",
-            "Operations per second per shard",
-            ["shard"],
-        )
-        REQUEST_DURATION = Histogram(
-            f"{self._metrics_namespace}_request_duration_seconds",
-            "Valkey request duration",
-            ["operation", "shard"],
         )
 
     async def get_client(self) -> Valkey | ValkeyCluster:
@@ -310,7 +194,7 @@ class ValkeyClient:
     async def __aenter__(self):
         if not await self.is_healthy():
             raise ConnectionError("Valkey connection failed")
-        self._metrics_task = asyncio.create_task(self._update_metrics())
+        return self
 
     @staticmethod
     def _maybe_json_decode(value: str | bytes) -> Any:
@@ -336,14 +220,10 @@ class ValkeyClient:
             timeout = ValkeyConfig.VALKEY_COMMAND_TIMEOUT
 
         async def _action():
-            with tracer.start_as_current_span("valkey.get") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "get")
-                span.set_attribute("db.redis.key", key)
-                # Remove 'timeout' from direct call to backend client
-                value = await (await self.get_client()).get(key)
-                span.set_status(StatusCode.OK)
-                return self._maybe_json_decode(value)
+            logger.debug(f"Valkey get operation for key: {key}")
+            # Remove 'timeout' from direct call to backend client
+            value = await (await self.get_client()).get(key)
+            return self._maybe_json_decode(value)
 
         return await handle_valkey_exceptions(
             _action, logger=logger, endpoint="valkey.get", wrap_http_exception=wrap_http_exception
@@ -360,17 +240,12 @@ class ValkeyClient:
             timeout = ValkeyConfig.VALKEY_COMMAND_TIMEOUT
 
         async def _action():
-            with tracer.start_as_current_span("valkey.set") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "set")
-                span.set_attribute("db.redis.key", key)
-                span.set_attribute("db.redis.ttl", ex or 0)
-                # Remove 'timeout' from direct call to backend client
-                result = await (await self.get_client()).set(
-                    key, json.dumps(value), ex=ex
-                )
-                span.set_status(StatusCode.OK)
-                return result
+            logger.debug(f"Valkey set operation for key: {key}, ttl: {ex or 0}")
+            # Remove 'timeout' from direct call to backend client
+            result = await (await self.get_client()).set(
+                key, json.dumps(value), ex=ex
+            )
+            return result
 
         return await handle_valkey_exceptions(
             _action, logger=logger, endpoint="valkey.set"
@@ -378,15 +253,22 @@ class ValkeyClient:
 
     async def delete(self, *keys: str, timeout: float = DEFAULT_COMMAND_TIMEOUT) -> int:
         async def _action():
-            with tracer.start_as_current_span("valkey.delete") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "delete")
-                span.set_attribute("db.redis.keys", str(keys))
-                # Remove 'timeout' from direct call to backend client (see debugging_tests.md)
-                return await (await self.get_client()).delete(*keys)
+            logger.debug(f"Valkey delete operation for keys: {keys}")
+            # Remove 'timeout' from direct call to backend client (see debugging_tests.md)
+            return await (await self.get_client()).delete(*keys)
 
         return await handle_valkey_exceptions(
             _action, logger=logger, endpoint="valkey.delete"
+        )
+
+    async def delete_many(self, keys: list[str], timeout: float = DEFAULT_COMMAND_TIMEOUT) -> int:
+        """Delete multiple keys at once"""
+        async def _action():
+            logger.debug(f"Valkey delete_many operation for keys: {keys}")
+            return await (await self.get_client()).delete(*keys)
+
+        return await handle_valkey_exceptions(
+            _action, logger=logger, endpoint="valkey.delete_many"
         )
 
     async def is_healthy(self) -> bool:
@@ -397,13 +279,9 @@ class ValkeyClient:
 
     async def incr(self, key: str, timeout: float = DEFAULT_COMMAND_TIMEOUT) -> int:
         async def _action():
-            with tracer.start_as_current_span("valkey.incr") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "incr")
-                span.set_attribute("db.redis.key", key)
-                value = await (await self.get_client()).incr(key)
-                span.set_status(StatusCode.OK)
-                return value
+            logger.debug(f"Valkey incr operation for key: {key}")
+            value = await (await self.get_client()).incr(key)
+            return value
 
         return await handle_valkey_exceptions(
             _action, logger=logger, endpoint="valkey.incr"
@@ -413,14 +291,9 @@ class ValkeyClient:
         self, key: str, ex: int, timeout: float = DEFAULT_COMMAND_TIMEOUT
     ) -> bool:
         async def _action():
-            with tracer.start_as_current_span("valkey.expire") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "expire")
-                span.set_attribute("db.redis.key", key)
-                span.set_attribute("db.redis.ttl", ex)
-                result = await (await self.get_client()).expire(key, ex)
-                span.set_status(StatusCode.OK)
-                return result
+            logger.debug(f"Valkey expire operation for key: {key}, ttl: {ex}")
+            result = await (await self.get_client()).expire(key, ex)
+            return result
 
         return await handle_valkey_exceptions(
             _action, logger=logger, endpoint="valkey.expire"
@@ -428,13 +301,9 @@ class ValkeyClient:
 
     async def ttl(self, key: str, timeout: float = DEFAULT_COMMAND_TIMEOUT) -> int:
         async def _action():
-            with tracer.start_as_current_span("valkey.ttl") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "ttl")
-                span.set_attribute("db.redis.key", key)
-                value = await (await self.get_client()).ttl(key)
-                span.set_status(StatusCode.OK)
-                return value
+            logger.debug(f"Valkey ttl operation for key: {key}")
+            value = await (await self.get_client()).ttl(key)
+            return value
 
         return await handle_valkey_exceptions(
             _action, logger=logger, endpoint="valkey.ttl"
@@ -445,28 +314,20 @@ class ValkeyClient:
         Flush the current Valkey database (for test isolation).
         """
         async def _action():
-            with tracer.start_as_current_span("valkey.flushdb") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "flushdb")
-                client = await self.get_client()
-                result = await client.flushdb()
-                span.set_status(StatusCode.OK)
-                return result
+            logger.debug("Valkey flushdb operation")
+            client = await self.get_client()
+            result = await client.flushdb()
+            return result
 
         return await handle_valkey_exceptions(
             _action, logger=logger, endpoint="valkey.flushdb"
         )
 
     async def exists(self, key: str, timeout: float = DEFAULT_COMMAND_TIMEOUT) -> bool:
-
         async def _action():
-            with tracer.start_as_current_span("valkey.exists") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "exists")
-                span.set_attribute("db.redis.key", key)
-                exists = await (await self.get_client()).exists(key)
-                span.set_status(StatusCode.OK)
-                return exists == 1
+            logger.debug(f"Valkey exists operation for key: {key}")
+            exists = await (await self.get_client()).exists(key)
+            return exists == 1
 
         return await handle_valkey_exceptions(
             _action, logger=logger, endpoint="valkey.exists"
@@ -474,11 +335,9 @@ class ValkeyClient:
 
     async def pipeline(self):
         async def _action():
-            with tracer.start_as_current_span("valkey.pipeline") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "pipeline")
-                client = await self.get_client()
-                return client.pipeline()
+            logger.debug("Valkey pipeline operation")
+            client = await self.get_client()
+            return client.pipeline()
 
         return await handle_valkey_exceptions(
             _action, logger=logger, endpoint="valkey.pipeline"
@@ -486,11 +345,9 @@ class ValkeyClient:
 
     async def pubsub(self):
         async def _action():
-            with tracer.start_as_current_span("valkey.pubsub") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "pubsub")
-                client = await self.get_client()
-                return client.pubsub()
+            logger.debug("Valkey pubsub operation")
+            client = await self.get_client()
+            return client.pubsub()
 
         return await handle_valkey_exceptions(
             _action, logger=logger, endpoint="valkey.pubsub"
@@ -501,36 +358,94 @@ class ValkeyClient:
         Publish a message to a channel.
         """
         async def _action():
-            with tracer.start_as_current_span("valkey.publish") as span:
-                span.set_attribute("db.system", "valkey")
-                span.set_attribute("db.operation", "publish")
-                client = await self.get_client()
-                return await client.publish(channel, message)
+            logger.debug(f"Valkey publish operation for channel: {channel}")
+            client = await self.get_client()
+            return await client.publish(channel, message)
+        
         return await handle_valkey_exceptions(
             _action, logger=logger, endpoint="valkey.publish"
         )
+        
+    async def scan(self, match: str = "*") -> list[str]:
+        """
+        Asynchronously scan for all keys matching the pattern.
+        Uses the underlying Redis/Valkey SCAN command.
+        """
+        async def _action():
+            logger.debug(f"Valkey scan operation for pattern: {match}")
+            cursor = 0
+            keys = []
+            while True:
+                cursor, batch = await (await self.get_client()).scan(cursor=cursor, match=match)
+                keys.extend(batch)
+                if cursor == 0:
+                    break
+            return keys
+            
+        return await handle_valkey_exceptions(
+            _action, logger=logger, endpoint="valkey.scan"
+        )
 
-    async def _update_metrics(self):
-        """Periodically update Valkey metrics"""
-        while True:
-            try:
-                client = await self.get_client()
-                info = await client.info("all")
+    async def lrem(self, key: str, count: int, value: str) -> int:
+        """
+        Remove elements from a list (like Redis LREM).
+        """
+        async def _action():
+            logger.debug(f"Valkey lrem operation for key: {key}, count: {count}")
+            result = await (await self.get_client()).lrem(key, count, value)
+            return result
+            
+        return await handle_valkey_exceptions(
+            _action, logger=logger, endpoint="valkey.lrem"
+        )
 
-                for shard, stats in info.items():
-                    if SHARD_SIZE_GAUGE:
-                        SHARD_SIZE_GAUGE.labels(shard=shard).set(
-                            stats.get("used_memory", 0)
-                        )
-                    if SHARD_OPS_GAUGE:
-                        SHARD_OPS_GAUGE.labels(shard=shard).set(
-                            stats.get("instantaneous_ops_per_sec", 0)
-                        )
+    async def rpush(self, key: str, value: str) -> int:
+        """
+        Append a value to a list (like Redis RPUSH).
+        """
+        async def _action():
+            logger.debug(f"Valkey rpush operation for key: {key}")
+            result = await (await self.get_client()).rpush(key, value)
+            return result
+            
+        return await handle_valkey_exceptions(
+            _action, logger=logger, endpoint="valkey.rpush"
+        )
 
-            except Exception as e:
-                logger.error(f"Metrics update failed: {e}")
+    async def llen(self, key: str) -> int:
+        """
+        Get the length of a list (like Redis LLEN).
+        """
+        async def _action():
+            logger.debug(f"Valkey llen operation for key: {key}")
+            result = await (await self.get_client()).llen(key)
+            return result
+            
+        return await handle_valkey_exceptions(
+            _action, logger=logger, endpoint="valkey.llen"
+        )
 
-            await asyncio.sleep(60)  # Update every minute
+    async def rpop(self, key: str) -> str | None:
+        """
+        Remove and get the last element in a list (like Redis RPOP).
+        """
+        async def _action():
+            logger.debug(f"Valkey rpop operation for key: {key}")
+            result = await (await self.get_client()).rpop(key)
+            return result
+            
+        return await handle_valkey_exceptions(
+            _action, logger=logger, endpoint="valkey.rpop"
+        )
+        
+    @property
+    def conn(self):
+        """Return the underlying Valkey/ValkeyCluster connection (sync, may be None if not initialized)."""
+        return self._client
+
+    async def aconn(self):
+        """Return the underlying Valkey/ValkeyCluster connection, initializing if needed (async)."""
+        return await self.get_client()
 
     def lock(self, name: str, timeout: float | None = None, sleep: float = 0.1, blocking: bool = True, blocking_timeout: float | None = None, thread_local: bool = True):
         """
@@ -543,13 +458,13 @@ class ValkeyClient:
 
 
 # Factory for Valkey client instance
-
 def get_valkey_client():
     """
     Returns a new ValkeyClient instance for the current event loop.
     Use this in async code to avoid event loop issues with singletons.
     """
     return ValkeyClient()
+
 # todo: Remove global singleton if not needed for legacy compatibility
 import warnings
 warnings.warn("The global 'client' singleton is deprecated. Use get_valkey_client() instead.", DeprecationWarning)

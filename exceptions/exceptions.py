@@ -5,8 +5,8 @@ Defines:
 - log_and_raise_valkey_exception utility
 - handle_valkey_exceptions async utility
 """
+import logging
 from fastapi import HTTPException
-from prometheus_client import Counter
 from valkey import ValkeyError
 from valkey.exceptions import (
     AskError,
@@ -42,11 +42,7 @@ from valkey.exceptions import (
     WatchError,
 )
 
-VALKEY_ERRORS = Counter(
-    "valkey_exceptions_total",
-    "Count of Valkey exceptions by error type",
-    ["error_type"]
-)
+logger = logging.getLogger(__name__)
 
 
 def log_and_raise_valkey_exception(
@@ -115,7 +111,7 @@ async def handle_valkey_exceptions(
     wrap_http_exception: bool = True,
 ):
     """
-    Utility to wrap Valkey logic with robust exception-to-HTTP mapping, metrics, and logging (Prometheus).
+    Utility to wrap Valkey logic with robust exception-to-HTTP mapping and logging.
 
     Usage (async):
         result = await handle_valkey_exceptions(
@@ -173,7 +169,6 @@ async def handle_valkey_exceptions(
     except tuple(VALKEY_ERRORS_MAPPING.keys()) as exc:
         status_code = getattr(exc, "status_code", None) or VALKEY_ERRORS_MAPPING.get(type(exc), 500)
         error_type = type(exc).__name__
-        VALKEY_ERRORS.labels(error_type=error_type).inc()
         detail = {
             "error": error_type,
             "message": str(exc),
@@ -189,7 +184,6 @@ async def handle_valkey_exceptions(
         else:
             raise exc
     except Exception as exc:
-        VALKEY_ERRORS.labels(error_type="UnhandledException").inc()
         detail = {
             "error": "UnhandledException",
             "message": str(exc),

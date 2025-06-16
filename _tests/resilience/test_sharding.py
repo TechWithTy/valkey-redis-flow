@@ -1,5 +1,5 @@
 """
-Production-grade Redis sharding tests with:
+Production-grade Redis sharding tests
 """
 import asyncio
 import logging
@@ -7,15 +7,13 @@ from datetime import datetime
 import pytest
 import logging
 from datetime import datetime
-from app.core.valkey_core.metrics import record_metrics
-from app.core.valkey_core.config import ValkeyConfig
 
 logger = logging.getLogger(__name__)
 
 @pytest.mark.asyncio
 async def test_shard_distribution(valkey_client):
     """
-    * Test keys are properly distributed across shards with metrics
+    * Test keys are properly distributed across shards
     * Uses injected valkey_client fixture for all Valkey operations
     * Follows fixture_strategy.md: unique keys, async best practices
     """
@@ -31,8 +29,8 @@ async def test_shard_distribution(valkey_client):
         keys = await keys.keys(f"test_dist_{test_id}_*")
         assert len(keys) == 1000
         duration = (datetime.now() - start_time).total_seconds()
-        record_metrics("redis_sharding_distribution_keys", 1000)
-        record_metrics("redis_sharding_distribution_duration", duration)
+        # Log metrics instead of recording with Prometheus
+        logger.info(f"Distribution test: 1000 keys in {duration:.2f}s")
     except Exception as e:
         logger.error(f"Shard distribution test failed: {type(e).__name__}: {e}")
         raise
@@ -55,6 +53,7 @@ async def test_shard_failover(valkey_client):
         if isinstance(stored, bytes):
             stored = stored.decode()
         assert stored == "value"
+        logger.info("Failover test: Successfully verified key after simulated failover")
     except Exception as e:
         logger.error(f"Shard failover test failed: {type(e).__name__}: {e}")
         raise
@@ -78,6 +77,7 @@ async def test_shard_rebalancing(valkey_client):
         # Simulate an edge case: try to get a non-existent key (should return None)
         missing = await valkey_client.get(f"edge_{uuid.uuid4()}")
         assert missing is None
+        logger.info("Rebalancing test: Successfully verified data integrity")
     except Exception as e:
         logger.error(f"Shard rebalancing test failed: {type(e).__name__}: {e}")
         raise
@@ -103,8 +103,8 @@ async def test_shard_performance_under_load(valkey_client):
         await asyncio.gather(*(set_key(i) for i in range(NUM_KEYS)))
         duration = (datetime.now() - start_time).total_seconds()
         logger.info(f"Set {NUM_KEYS} keys concurrently in {duration:.2f}s")
-        record_metrics("redis_sharding_load_test_operations", NUM_KEYS)
-        record_metrics("redis_sharding_load_test_duration", duration)
+        # Log metrics instead of recording with Prometheus
+        logger.info(f"Performance: {NUM_KEYS/duration:.2f} ops/sec")
         # Optionally, verify a few keys
         for i in range(0, NUM_KEYS, 50):
             val = await valkey_client.get(f"load_{test_id}_{i}")

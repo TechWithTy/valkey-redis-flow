@@ -7,8 +7,8 @@ import random
 from collections.abc import Callable, Coroutine
 from typing import Any, TypeVar
 
-from app.core.valkey_core.client import ValkeyClient
-from app.core.valkey_core.config import ValkeyConfig
+from ..client import ValkeyClient
+from ..config import ValkeyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ def cache(
         async def wrapper(*args, **kwargs):
             nonlocal client
             if client is None:
-                from app.core.valkey_core.client import client as default_client
+                from ..client import client as default_client
 
                 client = default_client
             valkey_client = await client.get_client()

@@ -49,33 +49,46 @@ async def check_rate_limit(client, key: str, limit: int, window: int) -> bool:
     See debugging guide: app/core/valkey_core/_tests/_docs/debugging_tests.md
     """
     now = datetime.utcnow()
+    # DEBUG: log entry parameters
+    print(f"🔍 DEBUG [check_rate_limit] start: key={key}, limit={limit}, window={window}, now={now.isoformat()}")
     # Defensive: handle None client gracefully (fail-closed)
     if client is None:
+        print(f"[check_rate_limit] Valkey client is None for key={key}. Failing closed.")
         logger.error(f"[check_rate_limit] Valkey client is None for key={key}. Failing closed.")
         return False
     redis = await client.aconn()
+    print(f"🔍 DEBUG [check_rate_limit] acquired Redis connection for key={key}")
     logger.debug(f"[check_rate_limit] Acquired async Valkey connection for key={key} at {now.isoformat()}.")
     
     # First, remove expired timestamps and get the current count
     try:
-        # Remove expired timestamps
-        await redis.zremrangebyscore(key, 0, (now - timedelta(seconds=window)).timestamp())
+        # DEBUG: remove expired entries
+        cutoff = (now - timedelta(seconds=window)).timestamp()
+        print(f"🔍 DEBUG [check_rate_limit] removing entries older than {cutoff}")
+        # Remove expired entries - check if this needs await or not
+        redis.zremrangebyscore(key, 0, cutoff)
         
         # Get current count BEFORE adding the new request
-        current_count = await redis.zcard(key)
+        current_count = redis.zcard(key)
+        print(f"🔍 DEBUG [check_rate_limit] current_count after cleanup: {current_count}")
         logger.debug(f"[check_rate_limit] Current count for key={key}: {current_count}, limit={limit}")
         
         # Check if adding one more would exceed the limit
         if current_count >= limit:
+            print(f"🔍 DEBUG [check_rate_limit] rate limit exceeded: current_count={current_count} >= limit={limit}")
             logger.debug(f"[check_rate_limit] Rate limit exceeded for key={key}: count={current_count}, limit={limit}")
             return False
         
         # If we're under the limit, add the current request
-        await redis.zadd(key, {now.timestamp(): now.timestamp()})
-        await redis.expire(key, window)
+        redis.zadd(key, {now.timestamp(): now.timestamp()})
+        print(f"🔍 DEBUG [check_rate_limit] added new entry timestamp {now.timestamp()}")
+        # Set key TTL
+        redis.expire(key, window)
+        print(f"🔍 DEBUG [check_rate_limit] set key expire to {window} seconds")
         
         return True
     except Exception as e:
+        print(f"🔍 DEBUG [check_rate_limit] exception occurred: {e}")
         logger.error(f"[check_rate_limit] Error in rate limiting: {str(e)}")
         # Fail closed on errors
         return False

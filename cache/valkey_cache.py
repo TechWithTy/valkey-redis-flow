@@ -14,7 +14,7 @@ import asyncio
 from collections.abc import Callable
 from typing import Any
 
-from app.core.valkey_core.client import client as valkey_client
+from ..client import client as valkey_client
 
 logger = logging.getLogger(__name__)
 

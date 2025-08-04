@@ -13,6 +13,7 @@ Follows best practices for:
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 from valkey.asyncio import Valkey, ValkeyCluster
@@ -22,10 +23,12 @@ from valkey.backoff import (
     ExponentialBackoff,
 )
 from valkey.retry import Retry
-from app.core.valkey_core.exceptions.exceptions import TimeoutError, ValkeyError
+from .exceptions.exceptions import TimeoutError, ValkeyError
 
-from app.core.valkey_core.config import ValkeyConfig
-from app.core.valkey_core.exceptions.exceptions import handle_valkey_exceptions
+from .config import ValkeyConfig
+from .exceptions.exceptions import handle_valkey_exceptions
+from .decorators import track_valkey_metrics
+from ..prometheus.metrics import get_cache_count, get_cache_latency, get_cache_hit_ratio
 
 VALKEY_CLUSTER = ValkeyConfig.VALKEY_CLUSTER
 VALKEY_DB = ValkeyConfig.VALKEY_DB
@@ -215,6 +218,7 @@ class ValkeyClient:
                 pass
         return value
 
+    @track_valkey_metrics('get')
     async def get(self, key: str, timeout: float = None, wrap_http_exception: bool = True) -> Any:
         if timeout is None:
             timeout = ValkeyConfig.VALKEY_COMMAND_TIMEOUT
@@ -223,12 +227,17 @@ class ValkeyClient:
             logger.debug(f"Valkey get operation for key: {key}")
             # Remove 'timeout' from direct call to backend client
             value = await (await self.get_client()).get(key)
+            
+            # Don't try to update cache hit ratio metric here
+            # We'll leave this to the background metrics collector
+                    
             return self._maybe_json_decode(value)
 
         return await handle_valkey_exceptions(
             _action, logger=logger, endpoint="valkey.get", wrap_http_exception=wrap_http_exception
         )
 
+    @track_valkey_metrics('set')
     async def set(
         self,
         key: str,
@@ -251,6 +260,7 @@ class ValkeyClient:
             _action, logger=logger, endpoint="valkey.set"
         )
 
+    @track_valkey_metrics('delete')
     async def delete(self, *keys: str, timeout: float = DEFAULT_COMMAND_TIMEOUT) -> int:
         async def _action():
             logger.debug(f"Valkey delete operation for keys: {keys}")
@@ -261,6 +271,7 @@ class ValkeyClient:
             _action, logger=logger, endpoint="valkey.delete"
         )
 
+    @track_valkey_metrics('delete')
     async def delete_many(self, keys: list[str], timeout: float = DEFAULT_COMMAND_TIMEOUT) -> int:
         """Delete multiple keys at once"""
         async def _action():
